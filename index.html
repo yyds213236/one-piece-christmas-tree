@@ -111,6 +111,7 @@ const pointData = new Float32Array(maxPoints * 7);
 const lineData = new Float32Array(22000 * 7);
 let pointLength = 0;
 let lineLength = 0;
+let portraitStart = 0;
 let width = 0;
 let height = 0;
 let dpr = 1;
@@ -213,6 +214,38 @@ function sampleTrack(keys, t) {
 }
 
 const portrait = decode(artwork.portrait);
+const portraitSaturation = .5;
+// Color anchors follow the crew's positions in the original 1280 × 720 portrait.
+const portraitColors = [
+  [245, 164, .24, .63, 1],    // Franky
+  [450, 251, .71, .33, 1],    // Robin
+  [643, 102, .13, .89, 1],    // Jinbe
+  [770, 225, 1, .83, .25],    // Sanji
+  [1019, 166, .49, .58, 1],   // Brook
+  [133, 512, 1, .31, .68],    // Chopper
+  [382, 536, .27, 1, .57],    // Zoro
+  [635, 401, 1, .28, .39],    // Luffy
+  [862, 449, 1, .68, .19],    // Usopp
+  [1038, 525, 1, .44, .17]    // Nami
+];
+for (const p of portrait) {
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  for (const [x, y, r, g, b] of portraitColors) {
+    const distance = (p.x - x) ** 2 + (p.y - y) ** 2;
+    const weight = (1 + distance / 2704) ** -2;
+    red += r * weight;
+    green += g * weight;
+    blue += b * weight;
+  }
+  const peak = Math.max(red, green, blue);
+  p.tint = [
+    mix(1, red / peak, portraitSaturation),
+    mix(1, green / peak, portraitSaturation),
+    mix(1, blue / peak, portraitSaturation)
+  ];
+}
 const vortex = Array.from({ length: 4950 }, () => {
   const angle = random() * TAU;
   const radius = random() ** 1.10;
@@ -365,6 +398,7 @@ function drawPortrait(t) {
   const fade = 1 - smooth(18.13, 18.86, t);
   const shock = Math.sin(Math.PI * smooth(9.92, 10.49, t));
   const loose = (1 - lock) * reveal;
+  const colorIn = mix(.44, 1, smooth(10.06, 10.76, t));
   for (let i = 0; i < portrait.length; i++) {
     const p = portrait[i];
     const jitter = (p.wiggle + Math.abs(p.drift)) * (.64 + loose * 27);
@@ -374,10 +408,14 @@ function drawPortrait(t) {
     const y = baseY * (.44 + .56 * reveal) + Math.cos(p.phase + 3.5 * t) * jitter;
     const twinkle = .72 + .28 * Math.sin(t * (3.2 + 8 * p.wiggle) + p.phase);
     const alpha = reveal * fade * (p.value * 2.60 + shock * .44) * twinkle;
-    if (p.value > .23) point(x, y, p.r, p.g, p.b, alpha * .17, 4.05);
-    point(x, y, p.r, p.g, p.b, alpha, (1.56 + 1.25 * p.wiggle) * (1 + .42 * shock));
+    const [red, green, blue] = p.tint;
+    const r = mix(p.r, red, colorIn);
+    const g = mix(p.g, green, colorIn);
+    const b = mix(p.b, blue, colorIn);
+    const size = (8.4 + p.wiggle * 5.6) * (1 + .35 * shock);
+    point(x, y, r, g, b, alpha, size);
     if (i % 5 === 0 && shock > .08) {
-      trail(x, y, x * (1 - shock * .36), y * (1 - shock * .36), p.r, p.g, p.b, alpha * shock * .8);
+      trail(x, y, x * (1 - shock * .36), y * (1 - shock * .36), r, g, b, alpha * shock * .8);
     }
   }
 }
@@ -411,10 +449,21 @@ function webglRenderer() {
   gl.attachShader(program, shader(gl.FRAGMENT_SHADER, `
     precision mediump float;
     uniform bool u_line;
+    uniform bool u_portrait;
     varying vec4 v_tint;
     varying float v_flat;
     void main() {
       float alpha = v_tint.a;
+      if (u_portrait) {
+        vec2 offset = (gl_PointCoord - .5) * 2.;
+        float radius = length(offset);
+        float core = (1. - smoothstep(.055, .24, radius)) * min(alpha, 1.38);
+        float falloff = .24 * exp(-14. * radius * radius) + .10 * exp(-4.2 * radius * radius);
+        float halo = falloff * (1. - smoothstep(.69, 1., radius)) * min(alpha, 1.4);
+        vec3 coreColor = mix(v_tint.rgb, vec3(1.), .20);
+        gl_FragColor = vec4(coreColor * core + v_tint.rgb * halo, core + halo);
+        return;
+      }
       if (!u_line) {
         float r = length((gl_PointCoord - .5) / vec2(1., v_flat)) * 2.;
         alpha *= 1. - smoothstep(.24, .98, r);
@@ -439,8 +488,9 @@ function webglRenderer() {
   const view = gl.getUniformLocation(program, "u_view");
   const magnification = gl.getUniformLocation(program, "u_scale");
   const line = gl.getUniformLocation(program, "u_line");
+  const portraitGlow = gl.getUniformLocation(program, "u_portrait");
   for (const attr of [position, tint, size]) gl.enableVertexAttribArray(attr);
-  function batch(index, data, length, mode) {
+  function batch(index, data, length, mode, glowStart = length) {
     if (!length) return;
     gl.bindBuffer(gl.ARRAY_BUFFER, buffers[index]);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, data.subarray(0, length));
@@ -448,7 +498,12 @@ function webglRenderer() {
     gl.vertexAttribPointer(tint, 4, gl.FLOAT, false, 28, 8);
     gl.vertexAttribPointer(size, 1, gl.FLOAT, false, 28, 24);
     gl.uniform1i(line, mode === gl.LINES ? 1 : 0);
-    gl.drawArrays(mode, 0, length / 7);
+    gl.uniform1i(portraitGlow, 0);
+    gl.drawArrays(mode, 0, glowStart / 7);
+    if (glowStart < length) {
+      gl.uniform1i(portraitGlow, 1);
+      gl.drawArrays(mode, glowStart / 7, (length - glowStart) / 7);
+    }
   }
   return () => {
     gl.viewport(0, 0, canvas.width, canvas.height);
@@ -457,7 +512,7 @@ function webglRenderer() {
     gl.uniform2f(view, canvas.width, canvas.height);
     gl.uniform1f(magnification, scale * dpr);
     batch(0, lineData, lineLength, gl.LINES);
-    batch(1, pointData, pointLength, gl.POINTS);
+    batch(1, pointData, pointLength, gl.POINTS, portraitStart);
   };
 }
 
@@ -479,11 +534,26 @@ function canvasRenderer() {
       ctx.lineTo(lineData[i + 7] * scale, lineData[i + 8] * scale);
       ctx.stroke();
     }
-    for (let i = 0; i < pointLength; i += 7) {
+    for (let i = 0; i < portraitStart; i += 7) {
       const size = Math.max(.62, Math.abs(pointData[i + 6]) * scale * .66);
       const pointHeight = pointData[i + 6] < 0 ? Math.max(.56, size * .49) : size;
       ctx.fillStyle = color(pointData, i, pointData[i + 5] * .82);
       ctx.fillRect(pointData[i] * scale - size / 2, pointData[i + 1] * scale - pointHeight / 2, size, pointHeight);
+    }
+    if (portraitStart < pointLength) {
+      for (let i = portraitStart; i < pointLength; i += 7) {
+        const x = pointData[i] * scale;
+        const y = pointData[i + 1] * scale;
+        const size = pointData[i + 6] * scale;
+        const alpha = clamp(pointData[i + 5], 0, 1.4);
+        ctx.fillStyle = color(pointData, i, alpha * .14);
+        ctx.beginPath();
+        ctx.arc(x, y, Math.max(.5, size * .32), 0, TAU);
+        ctx.fill();
+        const core = Math.max(.60, size * .16);
+        ctx.fillStyle = color(pointData, i, alpha * .88);
+        ctx.fillRect(x - core / 2, y - core / 2, core, core);
+      }
     }
   };
 }
@@ -510,6 +580,7 @@ function draw() {
   aura.style.opacity = 0;
   if (time < 9.15) drawTree(time);
   if (time > 7.38 && time < 10.36) drawVortex(time);
+  portraitStart = pointLength;
   if (time > 9.93) drawPortrait(time);
   render();
 }
